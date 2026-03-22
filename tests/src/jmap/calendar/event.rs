@@ -570,6 +570,24 @@ pub async fn test(params: &mut JMAPTest) {
           }
         ]));
 
+    // Synthetic recurrence update restrictions
+    let response = account
+        .jmap_update(
+            MethodObject::CalendarEvent,
+            [(
+                ids[1],
+                json!({
+                    "utcStart/value": "2006-01-02T12:00:00Z"
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await;
+    assert_eq!(
+        response.not_updated(ids[1]).description(),
+        "This property cannot be set on a recurrence instance."
+    );
+
     // Parse tests
     account
         .jmap_method_calls(json!([

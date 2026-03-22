@@ -138,14 +138,6 @@ impl CalendarEventSet for Server {
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
                 continue 'update;
-            } else if id.is_synthetic() {
-                response.not_updated.append(
-                    id,
-                    SetError::invalid_properties()
-                        .with_property(JSCalendarProperty::Id)
-                        .with_description("Updating synthetic ids is not yet supported."),
-                );
-                continue 'update;
             }
 
             // Obtain calendar_event card
@@ -174,7 +166,161 @@ impl CalendarEventSet for Server {
                 std::mem::take(&mut new_calendar_event.data.event).into_jscalendar::<Id, BlobId>();
 
             // Process changes
-            if let Err(err) = update_calendar_event(
+            if let Some(expansion_id) = id.expansion_id() {
+                // Synthetic ID: apply patches as recurrenceOverrides on the master event
+                let (datetime_key, _) = match resolve_expansion_datetime(
+                    &new_calendar_event.data,
+                    expansion_id,
+                ) {
+                    Some(result) => result,
+                    None => {
+                        response.not_updated.append(id, SetError::not_found());
+                        continue 'update;
+                    }
+                };
+
+                let js_calendar_events = js_calendar_group
+                    .0
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut(&Key::Property(JSCalendarProperty::Entries))
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap();
+                let js_calendar_event = if let Some(e) = js_calendar_events.first_mut() {
+                    e
+                } else {
+                    response.not_updated.append(
+                        id,
+                        SetError::invalid_properties()
+                            .with_description("Event has no entries."),
+                    );
+                    continue 'update;
+                };
+
+                for (property, value) in object.into_expanded_object() {
+                    let Key::Property(property) = property else {
+                        response.not_updated.append(
+                            id,
+                            SetError::invalid_properties()
+                                .with_property(property.to_owned())
+                                .with_description("Invalid property."),
+                        );
+                        continue 'update;
+                    };
+
+                    match property {
+                        JSCalendarProperty::Id
+                        | JSCalendarProperty::BaseEventId
+                        | JSCalendarProperty::IsOrigin
+                        | JSCalendarProperty::Method
+                        | JSCalendarProperty::Uid
+                        | JSCalendarProperty::RecurrenceRule
+                        | JSCalendarProperty::RecurrenceOverrides => {
+                            response.not_updated.append(
+                                id,
+                                SetError::invalid_properties()
+                                    .with_property(property)
+                                    .with_description(
+                                        "This property cannot be set on a recurrence instance.",
+                                    ),
+                            );
+                            continue 'update;
+                        }
+                        JSCalendarProperty::CalendarIds
+                        | JSCalendarProperty::IsDraft
+                        | JSCalendarProperty::MayInviteSelf
+                        | JSCalendarProperty::MayInviteOthers
+                        | JSCalendarProperty::HideAttendees
+                        | JSCalendarProperty::UseDefaultAlerts
+                        | JSCalendarProperty::UtcStart
+                        | JSCalendarProperty::UtcEnd => {
+                            response.not_updated.append(
+                                id,
+                                SetError::invalid_properties()
+                                    .with_property(property)
+                                    .with_description(
+                                        "This property can only be set on the master event.",
+                                    ),
+                            );
+                            continue 'update;
+                        }
+                        JSCalendarProperty::Pointer(pointer) => {
+                            // Reject pointer patches targeting master-level properties
+                            if matches!(
+                                pointer.first(),
+                                Some(JsonPointerItem::Key(Key::Property(
+                                    JSCalendarProperty::Id
+                                    | JSCalendarProperty::BaseEventId
+                                    | JSCalendarProperty::IsOrigin
+                                    | JSCalendarProperty::Method
+                                    | JSCalendarProperty::Uid
+                                    | JSCalendarProperty::CalendarIds
+                                    | JSCalendarProperty::IsDraft
+                                    | JSCalendarProperty::MayInviteSelf
+                                    | JSCalendarProperty::MayInviteOthers
+                                    | JSCalendarProperty::HideAttendees
+                                    | JSCalendarProperty::UseDefaultAlerts
+                                    | JSCalendarProperty::UtcStart
+                                    | JSCalendarProperty::UtcEnd
+                                    | JSCalendarProperty::RecurrenceRule
+                                    | JSCalendarProperty::RecurrenceOverrides
+                                )))
+                            ) {
+                                response.not_updated.append(
+                                    id,
+                                    SetError::invalid_properties()
+                                        .with_property(JSCalendarProperty::Pointer(pointer))
+                                        .with_description(
+                                            "This property cannot be set on a recurrence instance.",
+                                        ),
+                                );
+                                continue 'update;
+                            }
+
+                            // Prepend recurrenceOverrides/<datetime>/ to the pointer
+                            let mut items: Vec<JsonPointerItem<JSCalendarProperty<Id>>> = vec![
+                                JsonPointerItem::Key(Key::Property(
+                                    JSCalendarProperty::RecurrenceOverrides,
+                                )),
+                                JsonPointerItem::Key(Key::Owned(datetime_key.clone())),
+                            ];
+                            for item in pointer.iter() {
+                                items.push(item.clone());
+                            }
+                            if !js_calendar_event.patch_jptr(items.iter().peekable(), value) {
+                                response.not_updated.append(
+                                    id,
+                                    SetError::invalid_properties()
+                                        .with_property(JSCalendarProperty::Pointer(pointer))
+                                        .with_description("Patch operation failed."),
+                                );
+                                continue 'update;
+                            }
+                        }
+                        _ => {
+                            // Wrap property as recurrenceOverrides/<datetime>/<property>
+                            let items: Vec<JsonPointerItem<JSCalendarProperty<Id>>> = vec![
+                                JsonPointerItem::Key(Key::Property(
+                                    JSCalendarProperty::RecurrenceOverrides,
+                                )),
+                                JsonPointerItem::Key(Key::Owned(datetime_key.clone())),
+                                JsonPointerItem::Key(Key::Property(property)),
+                            ];
+                            if !js_calendar_event.patch_jptr(items.iter().peekable(), value) {
+                                response.not_updated.append(
+                                    id,
+                                    SetError::invalid_properties()
+                                        .with_description(
+                                            "Patch operation failed for recurrence override.",
+                                        ),
+                                );
+                                continue 'update;
+                            }
+                        }
+                    }
+                }
+            } else if let Err(err) = update_calendar_event(
                 access_token,
                 object,
                 &mut new_calendar_event,
@@ -431,14 +577,230 @@ impl CalendarEventSet for Server {
             if !cache.has_item_id(&document_id) {
                 response.not_destroyed.append(id, SetError::not_found());
                 continue;
-            } else if id.is_synthetic() {
-                response.not_destroyed.append(
-                    id,
-                    SetError::invalid_properties()
-                        .with_property(JSCalendarProperty::Id)
-                        .with_description("Deleting synthetic ids is not yet supported."),
+            }
+
+            // Handle synthetic IDs (exclude recurrence instance from master event)
+            if let Some(expansion_id) = id.expansion_id() {
+                let Some(calendar_event_) = self
+                    .store()
+                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                        account_id,
+                        Collection::CalendarEvent,
+                        document_id,
+                    ))
+                    .await
+                    .caused_by(trc::location!())?
+                else {
+                    response.not_destroyed.append(id, SetError::not_found());
+                    continue 'destroy;
+                };
+
+                let calendar_event = calendar_event_
+                    .to_unarchived::<CalendarEvent>()
+                    .caused_by(trc::location!())?;
+                let mut new_calendar_event = calendar_event
+                    .deserialize::<CalendarEvent>()
+                    .caused_by(trc::location!())?;
+
+                // Resolve expansion to datetime
+                let (datetime_key, _) = match resolve_expansion_datetime(
+                    &new_calendar_event.data,
+                    expansion_id,
+                ) {
+                    Some(result) => result,
+                    None => {
+                        response.not_destroyed.append(id, SetError::not_found());
+                        continue 'destroy;
+                    }
+                };
+
+                // Validate ACLs (need modify permission since we're updating master)
+                if let Some(can_modify_calendars) = &can_modify_calendars {
+                    for name in calendar_event.inner.names.iter() {
+                        let parent_id = name.parent_id.to_native();
+                        if !can_modify_calendars.contains(parent_id) {
+                            response.not_destroyed.append(
+                                id,
+                                SetError::forbidden().with_description(format!(
+                                    "You are not allowed to modify calendar {}.",
+                                    Id::from(parent_id)
+                                )),
+                            );
+                            continue 'destroy;
+                        }
+                    }
+                }
+
+                // Convert to JSCalendar and set excluded override
+                let mut js_calendar_group =
+                    std::mem::take(&mut new_calendar_event.data.event)
+                        .into_jscalendar::<Id, BlobId>();
+
+                let js_calendar_events = js_calendar_group
+                    .0
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut(&Key::Property(JSCalendarProperty::Entries))
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap();
+
+                if let Some(js_calendar_event) = js_calendar_events.first_mut() {
+                    let items: Vec<JsonPointerItem<JSCalendarProperty<Id>>> = vec![
+                        JsonPointerItem::Key(Key::Property(
+                            JSCalendarProperty::RecurrenceOverrides,
+                        )),
+                        JsonPointerItem::Key(Key::Owned(datetime_key)),
+                        JsonPointerItem::Key(Key::Property(JSCalendarProperty::Excluded)),
+                    ];
+                    if !js_calendar_event.patch_jptr(items.iter().peekable(), Value::Bool(true)) {
+                        response.not_destroyed.append(
+                            id,
+                            SetError::invalid_properties()
+                                .with_description(
+                                    "Failed to exclude recurrence instance.",
+                                ),
+                        );
+                        continue 'destroy;
+                    }
+                } else {
+                    response.not_destroyed.append(id, SetError::not_found());
+                    continue 'destroy;
+                }
+
+                // Convert back to iCalendar
+                let Some(ical) = js_calendar_group.into_icalendar() else {
+                    response.not_destroyed.append(
+                        id,
+                        SetError::invalid_properties().with_description(
+                            "Failed to convert calendar event to iCalendar.",
+                        ),
+                    );
+                    continue 'destroy;
+                };
+                new_calendar_event.data.event = ical;
+
+                // Build event data
+                new_calendar_event.size = new_calendar_event.data.event.size() as u32;
+                if new_calendar_event.size as usize > self.core.groupware.max_ical_size {
+                    response.not_destroyed.append(
+                        id,
+                        SetError::invalid_properties().with_description(format!(
+                            "Event size {} exceeds the maximum allowed size of {} bytes.",
+                            new_calendar_event.size, self.core.groupware.max_ical_size
+                        )),
+                    );
+                    continue 'destroy;
+                }
+
+                // Validate quota
+                let extra_bytes = (new_calendar_event.size as u64)
+                    .saturating_sub(u32::from(calendar_event.inner.size) as u64);
+                if extra_bytes > 0 {
+                    match self
+                        .has_available_quota(
+                            &self.get_resource_token(access_token, account_id).await?,
+                            extra_bytes,
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(err)
+                            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) =>
+                        {
+                            response.not_destroyed.append(id, SetError::over_quota());
+                            continue 'destroy;
+                        }
+                        Err(err) => return Err(err.caused_by(trc::location!())),
+                    }
+                }
+
+                let now = now() as i64;
+                let prev_email_alarm =
+                    calendar_event.inner.data.next_alarm(now, Tz::Floating);
+                let mut next_email_alarm = None;
+                new_calendar_event.data = CalendarEventData::new(
+                    new_calendar_event.data.event,
+                    Tz::Floating,
+                    self.core.groupware.max_ical_instances,
+                    &mut next_email_alarm,
                 );
-                continue;
+
+                // Handle scheduling
+                let mut itip_messages = None;
+                if send_scheduling_messages
+                    && self.core.groupware.itip_enabled
+                    && !access_token.emails.is_empty()
+                    && access_token.has_permission(Permission::CalendarSchedulingSend)
+                    && new_calendar_event.data.event_range_end() > now
+                    && new_calendar_event.schedule_tag.is_some()
+                {
+                    let old_ical = rkyv_deserialize(&calendar_event.inner.data.event)
+                        .caused_by(trc::location!())?;
+                    match itip_update(
+                        &mut new_calendar_event.data.event,
+                        &old_ical,
+                        access_token.emails.as_slice(),
+                    ) {
+                        Ok(messages) => {
+                            let mut is_organizer = false;
+                            if messages
+                                .iter()
+                                .map(|r| {
+                                    is_organizer = r.from_organizer;
+                                    r.to.len()
+                                })
+                                .sum::<usize>()
+                                < self.core.groupware.itip_outbound_max_recipients
+                            {
+                                if is_organizer {
+                                    if let Some(tag) =
+                                        &mut new_calendar_event.schedule_tag
+                                    {
+                                        *tag += 1;
+                                    }
+                                }
+                                itip_messages = Some(ItipMessages::new(messages));
+                            }
+                        }
+                        Err(err) => {
+                            if !err.is_jmap_error() {
+                                if let Some(tag) =
+                                    &mut new_calendar_event.schedule_tag
+                                {
+                                    *tag += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update master event (not delete)
+                new_calendar_event
+                    .update(
+                        access_token,
+                        calendar_event,
+                        account_id,
+                        document_id,
+                        &mut batch,
+                    )
+                    .caused_by(trc::location!())?;
+                if prev_email_alarm != next_email_alarm {
+                    if let Some(prev_alarm) = prev_email_alarm {
+                        prev_alarm.delete_task(&mut batch);
+                    }
+                    if let Some(next_alarm) = next_email_alarm {
+                        next_alarm.write_task(&mut batch);
+                    }
+                }
+                if let Some(itip_messages) = itip_messages {
+                    itip_messages
+                        .queue(&mut batch)
+                        .caused_by(trc::location!())?;
+                }
+
+                response.destroyed.push(id);
+                continue 'destroy;
             }
 
             let Some(calendar_event_) = self
@@ -895,6 +1257,50 @@ fn update_calendar_event<'x>(
     }
 
     Ok(use_default_alerts.then_some(show_without_time))
+}
+
+fn resolve_expansion_datetime(
+    data: &CalendarEventData,
+    expansion_id: u32,
+) -> Option<(String, u32)> {
+    let default_tz = Tz::Floating;
+    let mut expansion_ids = AHashSet::new();
+    expansion_ids.insert(expansion_id);
+
+    let expansion = data
+        .expand_from_ids(&mut expansion_ids, default_tz)?
+        .into_iter()
+        .next()?;
+
+    if !expansion.is_valid() {
+        return None;
+    }
+
+    let comp = data.event.components.get(expansion.comp_id as usize)?;
+    let tz = comp
+        .entries
+        .iter()
+        .find_map(|e| {
+            if matches!(e.name, ICalendarProperty::Dtstart) {
+                e.tz_id().and_then(|id| Tz::from_str(id).ok())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_tz);
+
+    let local_dt = if tz.is_floating() {
+        DateTime::from_timestamp(expansion.start, 0)?.naive_utc()
+    } else {
+        DateTime::from_timestamp(expansion.start, 0)?
+            .with_timezone(&tz)
+            .naive_local()
+    };
+
+    Some((
+        local_dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        expansion.comp_id,
+    ))
 }
 
 fn patch_parent_ids(
